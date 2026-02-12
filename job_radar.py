@@ -188,9 +188,12 @@ def google_rss():
 
     jobs=[]
 
+    import urllib.parse
+    
     query='("finance" OR "strategy" OR "investment banking") job site:myworkdayjobs.com'
+    
+    url="https://news.google.com/rss/search?q="+urllib.parse.quote(query)
 
-    url="https://news.google.com/rss/search?q="+query
 
     feed=feedparser.parse(url)
 

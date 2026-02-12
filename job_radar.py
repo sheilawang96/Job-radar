@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import feedparser
 from dateutil import parser as dateparser
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -18,81 +19,99 @@ from email.mime.text import MIMEText
 # =========================
 # CONFIG
 # =========================
+
+LOOKBACK_HOURS = 6           
+MAX_EMAIL_ITEMS = 120
+REQUEST_TIMEOUT = 15
+USER_AGENT = "job-radar/2.0 (personal use)"
+
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 587
+
+STATE_PATH = "state/seen.json"   # persisted via GitHub Actions cache
+
+
 # ======================
 # LOCATION FILTERING
 # ======================
 
 US_KEYWORDS = [
     "united states", "united states of america", "u.s.", "u.s.a", "usa",
-    "remote - us", "remote (us)", "remote, us", "us remote"
+    "remote - us", "remote (us)", "remote, us", "us remote", "us-only", "us only"
 ]
-
 
 CALIFORNIA_KEYWORDS = [
     "california", "ca", "san francisco", "sf", "bay area",
     "los angeles", "la", "santa clara", "palo alto",
-    "mountain view", "sunnyvale", "san jose", "redwood city"
+    "mountain view", "sunnyvale", "san jose", "redwood city",
+    "san mateo", "menlo park", "cupertino", "irvine", "san diego"
 ]
 
-LOOKBACK_HOURS = 6
-MAX_EMAIL_ITEMS = 80
-REQUEST_TIMEOUT = 20
-USER_AGENT = "job-radar/1.0 (personal use)"
+US_STATE_ABBR = {
+    "al","ak","az","ar","ca","co","ct","de","fl","ga","hi","id","il","in","ia","ks","ky","la","me","md",
+    "ma","mi","mn","ms","mo","mt","ne","nv","nh","nj","nm","ny","nc","nd","oh","ok","or","pa","ri","sc",
+    "sd","tn","tx","ut","vt","va","wa","wv","wi","wy","dc"
+}
 
-# Gmail SMTP (use App Password)
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 587
+# ======================
+# FULL COMPANY LIST (your list)
+# ======================
 
-STATE_PATH = "state/seen.json"   # persisted via GitHub Actions cache
+TARGET_COMPANY_NAMES = [
+    "Adobe","Affirm","Airbnb","Amazon","Anthropic","Apple","Atlassian","Brex","Chime","Cisco","Cloudflare",
+    "Coinbase","Databricks","Datadog","Discord","DocuSign","DoorDash","Duolingo","Google","Elastic","Figma",
+    "Janestreet","Jane Street","LinkedIn","Lyft","Mathworks","MathWorks","Meta","Microsoft","Netflix",
+    "Next Insurance","Lemonade","Nextdoor","Notion","Nvidia","Okta","Oracle","OpenAI","Palantir","Pinterest",
+    "Plaid","Ramp","Robinhood","Roblox","Scale AI","Scopely","Slack","Splunk","Snowflake","SoFi","Spotify",
+    "Square","Stripe","Tesla","Twilio","Uber","Unity","Wayve","Wealthfront","Betterment","Workday","Zendesk"
+]
 
-# ---- Keyword engine (broad, high-volume) ----
+# ======================
+# KEYWORD ENGINE (big version)
+# ======================
+
 KW_HIGH = [
-    # Core finance / FP&A
+    # Finance core
     "strategic finance","finance strategy","product finance","business finance","finance business partner",
-    "corporate finance","fp&a","planning and analysis","planning & analysis","forecasting","budgeting",
-    "variance","kpi","operational finance","commercial finance","go-to-market finance","gtm finance",
-    "revenue finance","pricing finance","growth finance","monetization finance","accounting",
+    "corporate finance","fp&a","planning and analysis","planning & analysis","forecasting","budgeting","variance",
+    "kpi","operational finance","commercial finance","gtm finance","go-to-market finance","revenue finance",
+    "pricing finance","growth finance","monetization finance","gross margin","unit economics","cac","ltv",
+    "cohort","retention","contribution margin","investment bank",
 
-    # Deals / consulting overlap
-    "corporate development","corp dev","m&a","mergers","acquisitions","transaction","due diligence",
-    "valuation","investment analysis","deal analysis","lbo","dcf","investment bank","deal"
+    # Accounting / controllership-ish (keep broad)
+    "accounting","technical accounting","controllership","controller","close","month-end","sox","audit",
 
-    # BizOps / strategy overlap (often finance-adjacent in tech)
-    "bizops","business operations","strategy & operations","strategy and operations","business insights",
-    "performance analytics","planning analyst","business analytics","analytics strategy"
+    # Deals / M&A
+    "corporate development","corp dev","m&a","mergers","acquisitions","transaction","transactions",
+    "due diligence","valuation","lbo","dcf","investment analysis","deal analysis","investment bank","investment banking",
+    "private equity","venture capital","strategic investments","integration","post-merger","pmi","deal",
+
+    # BizOps / Strategy overlap
+    "bizops","business operations","strategy & operations","strategy and operations","operating model",
+    "business insights","performance analytics","planning analyst","business analytics","analytics strategy",
+    "strategic planning","s&o","s&op","sales ops","revenue ops","revops","gtm strategy"
 ]
 
 KW_MED = [
-    "financial analyst","finance analyst","finance manager","finance associate","strategy analyst",
+    "financial analyst","finance analyst","finance manager","finance associate","strategy analyst","strategy manager",
     "business analyst","operations analyst","revenue analyst","pricing analyst","growth analyst",
-    "monetization","pricing strategy","go-to-market","gtm","analytics","sql","etl","dashboard","reporting",
-    "planning","strategic planning","commercial"
+    "monetization","pricing","go-to-market","gtm","analytics","sql","etl","dashboard","reporting","modeling",
+    "budget","forecast","variance analysis","data analysis","data modeling","metrics","kpi reporting",
+    "commercial","market sizing","biz strategy","product strategy","product ops","program finance",
+    "workload finance","cloud finance","infra finance","data center finance"
 ]
 
 NEGATIVE = [
     "warehouse","area manager","night shift","hourly","driver","fulfillment","store associate","retail",
-    "manufacturing","plant","security guard","nurse","cna","pharmacist","call center"
+    "manufacturing","plant","security guard","nurse","cna","pharmacist","call center","armed"
 ]
 
-# ---- Target companies you care about (used for scoring boost + LinkedIn search link text) ----
-TARGET_COMPANY_NAMES = [
-    "Adobe","Affirm","Airbnb","Amazon","Anthropic","Apple","Atlassian","Brex","Chime","Cisco","Cloudflare",
-    "Coinbase","Databricks","Datadog","Discord","DocuSign","DoorDash","Duolingo","Google","Elastic","Figma",
-    "Jane Street","LinkedIn","Lyft","MathWorks","Meta","Microsoft","Netflix","Next Insurance","Lemonade",
-    "Nextdoor","Notion","Nvidia","Okta","Oracle","OpenAI","Palantir","Pinterest","Plaid","Ramp","Robinhood",
-    "Roblox","Scale AI","Scopely","Slack","Splunk","Snowflake","SoFi","Spotify","Square","Stripe","Tesla",
-    "Twilio","Uber","Unity","Wayve","Wealthfront","Betterment","Workday","Zendesk"
-]
 
 # =========================
-# ATS SOURCES
+# ATS SOURCES (starter set)
 # =========================
-# IMPORTANT: These "slugs" are ATS identifiers, not company names.
-# If a company doesn't return jobs, it likely uses a different ATS or a different slug.
-# You can add/remove entries freely.
 
 GREENHOUSE_SLUGS = {
-    # Common GH board slugs (starter set)
     "Airbnb": "airbnb",
     "Coinbase": "coinbase",
     "Databricks": "databricks",
@@ -107,11 +126,9 @@ GREENHOUSE_SLUGS = {
     "Stripe": "stripe",
     "Twilio": "twilio",
     "Zendesk": "zendesk",
-    # Add more as you confirm slugs
 }
 
 LEVER_SLUGS = {
-    # Common Lever slugs (starter set)
     "Ramp": "ramp",
     "Brex": "brex",
     "Chime": "chime",
@@ -124,25 +141,21 @@ LEVER_SLUGS = {
     "Uber": "uber",
     "Unity": "unity",
     "Wealthfront": "wealthfront",
-    # Add more as you confirm slugs
 }
 
 SMARTRECRUITERS_COMPANY_KEYS = {
-    # SmartRecruiters uses a "company key" in the URL, often matches brand name but not always
     "Atlassian": "Atlassian",
     "Splunk": "Splunk",
-    # Add more as needed
 }
-
-# If you want to aggressively expand beyond your list, add additional slugs here.
 
 
 # =========================
 # DATA MODEL
 # =========================
+
 @dataclass
 class Job:
-    source: str              # greenhouse / lever / smartrecruiters
+    source: str
     company: str
     title: str
     location: str
@@ -158,39 +171,90 @@ class Job:
 # =========================
 # UTIL
 # =========================
-US_STATE_ABBR = {
-    "al","ak","az","ar","ca","co","ct","de","fl","ga","hi","id","il","in","ia","ks","ky","la","me","md",
-    "ma","mi","mn","ms","mo","mt","ne","nv","nh","nj","nm","ny","nc","nd","oh","ok","or","pa","ri","sc",
-    "sd","tn","tx","ut","vt","va","wa","wv","wi","wy","dc"
-}
+
+def norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def safe_dt(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return dateparser.parse(dt_str)
+    except Exception:
+        return None
+
+def http_get_json(url: str) -> Any:
+    headers = {"User-Agent": USER_AGENT}
+    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+def linkedin_referral_search_link(company: str, title: str) -> str:
+    q = f'{company} "{title}" finance strategy fp&a'
+    return "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(q)
+
+def detect_company(text: str) -> str:
+    t = norm(text)
+    for c in TARGET_COMPANY_NAMES:
+        if norm(c) in t:
+            return c
+    return "Unknown"
+
+def extract_location(text: str) -> str:
+    t = norm(text)
+
+    # quick hits
+    if "remote" in t:
+        # keep any state mentions
+        for st in US_STATE_ABBR:
+            if re.search(rf"(\b|,|\()({st})(\b|\)|\s)", t):
+                return f"Remote, {st.upper()}"
+        if "california" in t or " ca" in t:
+            return "Remote, CA"
+        if "united states" in t or "usa" in t or "us " in t:
+            return "Remote, US"
+        return "Remote"
+
+    # CA cities
+    for k in CALIFORNIA_KEYWORDS:
+        if k in t:
+            return "CA"
+
+    # any US state abbr
+    for st in US_STATE_ABBR:
+        if re.search(rf"(\b|,|\()({st})(\b|\)|\s)", t):
+            return st.upper()
+
+    # explicit US
+    if any(k in t for k in US_KEYWORDS):
+        return "US"
+
+    return ""
 
 def location_priority(location: str) -> int:
-    loc = (location or "").lower().strip()
+    loc = norm(location)
 
-    # if location missing → don't hard filter
     if not loc:
-        return 8
+        return 8  # treat missing as likely US-remote-ish
 
     is_ca = any(k in loc for k in CALIFORNIA_KEYWORDS)
 
-    # detect US via keyword OR state abbreviation OR CA
     is_us_keyword = any(k in loc for k in US_KEYWORDS)
-    state_hit = any(re.search(rf"(\\b|,|\\()({st})(\\b|\\)|\\s)", loc) for st in US_STATE_ABBR)
+    state_hit = any(re.search(rf"(\b|,|\()({st})(\b|\)|\s)", loc) for st in US_STATE_ABBR)
 
     is_us = is_us_keyword or state_hit or is_ca
 
-    # allow generic remote jobs
+    # allow generic remote jobs even if US isn't explicitly mentioned
     if not is_us and "remote" not in loc:
         return -999
 
     if is_ca:
         return 20
 
+    if "remote" in loc:
+        return 12
+
     return 5
-
-
-def norm(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 def score_job(job: Job) -> int:
     t = norm(job.title)
@@ -202,19 +266,19 @@ def score_job(job: Job) -> int:
             return -999
 
     score = 0
+
     loc_score = location_priority(job.location)
     if loc_score < 0:
         return -999
-
     score += loc_score
 
-
-    # Boost target companies
+    # company boost
     for name in TARGET_COMPANY_NAMES:
         if norm(name) in c:
             score += 8
             break
 
+    # keyword matching
     for kw in KW_HIGH:
         if kw in t or kw in d:
             score += 10
@@ -222,25 +286,12 @@ def score_job(job: Job) -> int:
         if kw in t or kw in d:
             score += 5
 
-    # Small nudges
+    # nudges
     if "manager" in t: score += 2
     if "senior" in t or t.startswith("sr"): score += 1
     if "intern" in t: score -= 2
 
     return score
-
-def safe_dt(dt_str: Optional[str]) -> Optional[datetime]:
-    if not dt_str:
-        return None
-    try:
-        return dateparser.parse(dt_str)
-    except Exception:
-        return None
-
-def linkedin_referral_search_link(company: str, title: str) -> str:
-    # Safe: just a search URL you click manually
-    q = f'{company} finance strategy FP&A "{title}"'
-    return "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(q)
 
 def load_seen() -> Dict[str, float]:
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
@@ -258,50 +309,34 @@ def save_seen(seen: Dict[str, float]) -> None:
         json.dump(seen, f, ensure_ascii=False, indent=2)
 
 def is_recent(job: Job, cutoff: datetime) -> bool:
-    # If we have posted_at, enforce cutoff. If not, allow (some ATS don’t provide accurate timestamps).
     if job.posted_at is None:
         return True
-    # normalize to aware UTC if possible
     if job.posted_at.tzinfo is None:
         dt = job.posted_at.replace(tzinfo=timezone.utc)
     else:
         dt = job.posted_at.astimezone(timezone.utc)
     return dt >= cutoff
 
-def http_get_json(url: str) -> Any:
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-def http_get_text(url: str) -> str:
-    headers = {"User-Agent": USER_AGENT}
-    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
-    r.raise_for_status()
-    return r.text
-
 
 # =========================
 # GREENHOUSE
 # =========================
+
 def fetch_greenhouse_jobs() -> List[Job]:
     jobs: List[Job] = []
     for company, slug in GREENHOUSE_SLUGS.items():
         url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
         try:
             data = http_get_json(url)
-            for j in data.get("jobs", []):
-                title = j.get("title", "").strip()
-                location = (j.get("location") or {}).get("name", "") or ""
-                apply_url = j.get("absolute_url", "") or ""
-                updated_at = j.get("updated_at")
-                created_at = j.get("created_at")
-                posted_at = safe_dt(updated_at) or safe_dt(created_at)
+            for j in (data.get("jobs", [])[:80]):
+                title = (j.get("title") or "").strip()
+                location = ((j.get("location") or {}).get("name") or "").strip()
+                apply_url = (j.get("absolute_url") or "").strip()
+                posted_at = safe_dt(j.get("updated_at")) or safe_dt(j.get("created_at"))
 
-                # description content can be long HTML; we keep a snippet
                 content = (j.get("content") or "")
-                snippet = re.sub("<[^<]+?>", " ", content)  # strip HTML tags
-                snippet = re.sub(r"\s+", " ", snippet).strip()[:800]
+                snippet = re.sub("<[^<]+?>", " ", content)
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:1000]
 
                 if not (title and apply_url):
                     continue
@@ -315,8 +350,8 @@ def fetch_greenhouse_jobs() -> List[Job]:
                     apply_url=apply_url,
                     description_snippet=snippet
                 ))
+            time.sleep(0.3)
         except Exception:
-            # Skip quietly; you can inspect failures in Actions logs
             continue
     return jobs
 
@@ -324,29 +359,30 @@ def fetch_greenhouse_jobs() -> List[Job]:
 # =========================
 # LEVER
 # =========================
+
 def fetch_lever_jobs() -> List[Job]:
     jobs: List[Job] = []
     for company, slug in LEVER_SLUGS.items():
         url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
         try:
             data = http_get_json(url)
-            for j in data:
+            for j in (data[:120]):
                 title = (j.get("text") or "").strip()
-                apply_url = j.get("hostedUrl") or j.get("applyUrl") or ""
-                categories = j.get("categories") or {}
+                apply_url = (j.get("hostedUrl") or j.get("applyUrl") or "").strip()
+
                 location = (j.get("categories") or {}).get("location") or (j.get("location") or "")
                 if isinstance(location, dict):
                     location = location.get("name", "") or ""
+                location = str(location or "")
 
                 created_at_ms = j.get("createdAt")
                 posted_at = None
                 if isinstance(created_at_ms, (int, float)):
                     posted_at = datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
 
-                # Lever provides description in HTML
                 desc_html = j.get("description") or ""
                 snippet = re.sub("<[^<]+?>", " ", desc_html)
-                snippet = re.sub(r"\s+", " ", snippet).strip()[:800]
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:1000]
 
                 if not (title and apply_url):
                     continue
@@ -355,11 +391,12 @@ def fetch_lever_jobs() -> List[Job]:
                     source="lever",
                     company=company,
                     title=title,
-                    location=str(location or ""),
+                    location=location,
                     posted_at=posted_at,
                     apply_url=apply_url,
                     description_snippet=snippet
                 ))
+            time.sleep(0.3)
         except Exception:
             continue
     return jobs
@@ -368,24 +405,25 @@ def fetch_lever_jobs() -> List[Job]:
 # =========================
 # SMARTRECRUITERS
 # =========================
+
 def fetch_smartrecruiters_jobs() -> List[Job]:
     jobs: List[Job] = []
     for company, key in SMARTRECRUITERS_COMPANY_KEYS.items():
-        # Public API endpoint
         url = f"https://api.smartrecruiters.com/v1/companies/{key}/postings"
         try:
             data = http_get_json(url)
-            for j in data.get("content", []):
+            for j in (data.get("content", [])[:120]):
                 title = (j.get("name") or "").strip()
-                apply_url = j.get("ref") or j.get("applyUrl") or ""
-                location = (j.get("location") or {}).get("city", "") or ""
+                apply_url = (j.get("ref") or j.get("applyUrl") or "").strip()
+
+                city = (j.get("location") or {}).get("city", "") or ""
                 country = (j.get("location") or {}).get("country", "") or ""
-                loc = ", ".join([x for x in [location, country] if x])
+                loc = ", ".join([x for x in [city, country] if x]).strip()
 
                 posted_at = safe_dt(j.get("releasedDate"))
 
                 snippet = (j.get("jobAd") or {}).get("sections", {}).get("companyDescription", "") or ""
-                snippet = re.sub(r"\s+", " ", snippet).strip()[:800]
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:1000]
 
                 if not (title and apply_url):
                     continue
@@ -399,59 +437,130 @@ def fetch_smartrecruiters_jobs() -> List[Job]:
                     apply_url=apply_url,
                     description_snippet=snippet
                 ))
+            time.sleep(0.3)
         except Exception:
             continue
     return jobs
 
 
 # =========================
+# GOOGLE NEWS RSS (Big Tech / Workday / custom ATS coverage)
+# =========================
+
+def news_rss_url(q: str) -> str:
+    return "https://news.google.com/rss/search?q=" + urllib.parse.quote(q)
+
+def build_news_queries() -> List[str]:
+    # Keep it limited to avoid slow runs.
+    # Strategy: site filter + role keywords + US/CA constraints
+    base_sites = '(site:jobs.lever.co OR site:boards.greenhouse.io OR site:myworkdayjobs.com OR site:careers OR site:jobs)'
+    geo = '("United States" OR USA OR "California" OR CA OR "Remote")'
+
+    role_blocks = [
+        '("strategic finance" OR "finance analyst" OR "product finance" OR FP&A OR "finance manager")',
+        '("corporate development" OR "M&A" OR "due diligence" OR valuation OR "investment banking")',
+        '("strategy" OR "strategy & operations" OR bizops OR "business operations" OR "finance & strategy")',
+        '("pricing" OR monetization OR "revenue finance" OR "growth finance")'
+    ]
+
+    # target companies in batches
+    batches = []
+    batch_size = 10
+    companies = [c for c in TARGET_COMPANY_NAMES if c.lower() not in ("janestreet",)]  # small clean-up
+    for i in range(0, len(companies), batch_size):
+        b = companies[i:i+batch_size]
+        batches.append("(" + " OR ".join([f'"{x}"' for x in b]) + ")")
+
+    queries = []
+    for rb in role_blocks:
+        for cb in batches[:6]:  # cap batches to keep runtime reasonable
+            queries.append(f"{base_sites} {cb} {rb} {geo} job")
+    return queries[:18]  # hard cap
+
+def fetch_google_news_rss_jobs() -> List[Job]:
+    jobs: List[Job] = []
+
+    for q in build_news_queries():
+        url = news_rss_url(q)
+        feed = feedparser.parse(url)
+
+        for e in feed.entries[:60]:
+            title = (getattr(e, "title", "") or "").strip()
+            link = (getattr(e, "link", "") or "").strip()
+            summary = (getattr(e, "summary", "") or "").strip()
+
+            if not title or not link:
+                continue
+
+            company = detect_company(title + " " + summary)
+            loc = extract_location(title + " " + summary)
+
+            # RSS usually doesn't provide a reliable posted datetime
+            posted_at = None
+
+            snippet = re.sub(r"\s+", " ", summary)[:1000]
+
+            jobs.append(Job(
+                source="google_news_rss",
+                company=company,
+                title=title,
+                location=loc,
+                posted_at=posted_at,
+                apply_url=link,
+                description_snippet=snippet
+            ))
+
+        time.sleep(0.2)
+
+    return jobs
+
+
+# =========================
 # EMAIL
 # =========================
+
 def send_email(subject: str, html_body: str) -> None:
+    sender = os.environ["JOBRADAR_EMAIL_FROM"]
+    receiver = os.environ["JOBRADAR_EMAIL_TO"]
+    password = os.environ["JOBRADAR_EMAIL_APP_PASSWORD"]
+
     msg = MIMEMultipart("alternative")
-    msg["From"] = SENDER
-    msg["To"] = RECEIVER
+    msg["From"] = sender
+    msg["To"] = receiver
     msg["Subject"] = subject
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
         server.ehlo()
         server.starttls()
-        server.login(SENDER, PASSWORD)
-        server.sendmail(SENDER, [RECEIVER], msg.as_string())
+        server.login(sender, password)
+        server.sendmail(sender, [receiver], msg.as_string())
 
 
 # =========================
 # MAIN
 # =========================
-def main():
-    sender = os.environ["JOBRADAR_EMAIL_FROM"]
-    receiver = os.environ["JOBRADAR_EMAIL_TO"]
-    password = os.environ["JOBRADAR_EMAIL_APP_PASSWORD"]
-    globals()["SENDER"] = sender
-    globals()["RECEIVER"] = receiver
-    globals()["PASSWORD"] = password
 
+def main():
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=LOOKBACK_HOURS)
 
     seen = load_seen()
 
     all_jobs: List[Job] = []
+    # ATS first (high quality)
     all_jobs += fetch_greenhouse_jobs()
     all_jobs += fetch_lever_jobs()
     all_jobs += fetch_smartrecruiters_jobs()
+    # Big Tech / Workday / custom ATS补全
+    all_jobs += fetch_google_news_rss_jobs()
 
-    # Filter + dedupe + score
     items: List[Tuple[int, Job]] = []
     for job in all_jobs:
         uid = job.uid()
-
-        # skip already emailed
         if uid in seen:
             continue
 
-        # recency filter (best effort)
         if not is_recent(job, cutoff):
             continue
 
@@ -461,34 +570,26 @@ def main():
 
         items.append((sc, job))
 
-    # Sort by score desc, then company/title
     items.sort(key=lambda x: (-x[0], x[1].company.lower(), x[1].title.lower()))
-
-    # Limit email size
     items = items[:MAX_EMAIL_ITEMS]
 
-    # Update seen state
     ts = time.time()
     for _, job in items:
         seen[job.uid()] = ts
 
-    # prune seen to avoid unbounded growth
-    # keep last ~20k entries
-    if len(seen) > 20000:
-        # drop oldest (by timestamp)
-        seen_items = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:20000]
+    if len(seen) > 25000:
+        seen_items = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:25000]
         seen = dict(seen_items)
 
     save_seen(seen)
 
-    # Build email
-    subject = f"Job Radar — Top matches (last {LOOKBACK_HOURS}h): {len(items)}"
+    subject = f"Job Radar — US-only (CA priority) — {len(items)} matches"
     if not items:
         html = f"""
         <p>Hi Sheila,</p>
-        <p>No new matches found in the last {LOOKBACK_HOURS} hours from the current ATS sources.</p>
-        <p>This usually means either (1) those company slugs need adjustment, or (2) postings didn’t change in that window.</p>
-        <p>If you want, add more Greenhouse/Lever/SmartRecruiters slugs and this will immediately get louder.</p>
+        <p>No new matches found in the last {LOOKBACK_HOURS} hours.</p>
+        <p>This can happen if postings didn’t change, or if many targets are on non-supported ATS. (We already added a Google RSS layer to cover Big Tech/Workday.)</p>
+        <p>Try again later or expand ATS slugs for specific companies.</p>
         """
         send_email(subject, html)
         return
@@ -504,7 +605,7 @@ def main():
 
         li.append(f"""
         <li>
-          <b>{job.company}</b> — {job.title} <br/>
+          <b>{job.company}</b> — {job.title}<br/>
           <span>Score: {sc} | Source: {job.source} | Location: {job.location or "N/A"} | Posted: {posted}</span><br/>
           <a href="{job.apply_url}">Apply link</a>
           &nbsp;|&nbsp;
@@ -514,11 +615,11 @@ def main():
 
     html = f"""
     <p>Hi Sheila,</p>
-    <p>Here are the newest matched roles from ATS sources (Greenhouse / Lever / SmartRecruiters) in the last {LOOKBACK_HOURS} hours.</p>
+    <p>Here are the newest US-only matches (California prioritized). Click Apply to apply directly.</p>
     <ol>
       {''.join(li)}
     </ol>
-    <p>Tip: If a company is missing, it likely uses a different ATS or a different slug. Add its slug in the config and it will show up next run.</p>
+    <p>Tip: For ATS sources, adding correct slugs (Greenhouse/Lever) boosts quality a lot. For Big Tech, the RSS layer helps cover Workday/custom ATS.</p>
     """
 
     send_email(subject, html)
@@ -526,3 +627,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

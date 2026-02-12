@@ -1,8 +1,8 @@
 import os
 import requests
 import re
-import time
 import smtplib
+import urllib.parse
 import feedparser
 from dataclasses import dataclass
 from email.mime.multipart import MIMEMultipart
@@ -23,12 +23,12 @@ EMAIL_PASS=os.environ["JOBRADAR_EMAIL_APP_PASSWORD"]
 # COMPANY FLOOD CONTROL
 ############################################
 
-MAX_PER_COMPANY_DEFAULT=5
+MAX_PER_COMPANY_DEFAULT=4
 
 COMPANY_CAPS={
-"Amazon":4,
-"Google":4,
-"Meta":4,
+"Amazon":3,
+"Google":3,
+"Meta":3,
 "Microsoft":3,
 "Apple":3,
 "Nvidia":2
@@ -63,36 +63,6 @@ EXCLUDE=[
 ]
 
 ############################################
-# ATS SOURCES
-############################################
-
-GREENHOUSE={
-"Airbnb":"airbnb",
-"Coinbase":"coinbase",
-"Databricks":"databricks",
-"Datadog":"datadog",
-"Notion":"notion",
-"Plaid":"plaid",
-"Robinhood":"robinhood",
-"Snowflake":"snowflake",
-"Stripe":"stripe",
-"Zendesk":"zendesk"
-}
-
-LEVER={
-"Ramp":"ramp",
-"Brex":"brex",
-"Chime":"chime",
-"Cloudflare":"cloudflare",
-"DoorDash":"doordash",
-"Duolingo":"duolingo",
-"Okta":"okta",
-"SoFi":"sofi",
-"Uber":"uber",
-"Unity":"unity"
-}
-
-############################################
 # DATA MODEL
 ############################################
 
@@ -108,9 +78,25 @@ class Job:
 # FILTER
 ############################################
 
-def good(title):
+def is_us_location(loc):
+
+    if not loc:
+        return True
+
+    loc=loc.lower()
+
+    if any(x in loc for x in ["united states","us","usa","remote","california","ca","new york"]):
+        return True
+
+    return False
+
+
+def good(title,location):
 
     t=title.lower()
+
+    if not is_us_location(location):
+        return False
 
     if any(b in t for b in EXCLUDE):
         return False
@@ -124,15 +110,27 @@ def good(title):
 # FETCH GREENHOUSE
 ############################################
 
+GREENHOUSE={
+"Airbnb":"airbnb",
+"Coinbase":"coinbase",
+"Databricks":"databricks",
+"Datadog":"datadog",
+"Notion":"notion",
+"Plaid":"plaid",
+"Robinhood":"robinhood",
+"Snowflake":"snowflake",
+"Stripe":"stripe",
+"Zendesk":"zendesk"
+}
+
 def greenhouse():
 
     jobs=[]
 
     for company,slug in GREENHOUSE.items():
 
-        url=f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
-
         try:
+            url=f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs"
             data=requests.get(url,timeout=10).json()
 
             for j in data.get("jobs",[]):
@@ -141,8 +139,7 @@ def greenhouse():
                 loc=j.get("location",{}).get("name","")
                 link=j.get("absolute_url","")
 
-                if good(title):
-
+                if good(title,loc):
                     jobs.append(Job(company,title,loc,link,"greenhouse"))
 
         except:
@@ -154,15 +151,27 @@ def greenhouse():
 # FETCH LEVER
 ############################################
 
+LEVER={
+"Ramp":"ramp",
+"Brex":"brex",
+"Chime":"chime",
+"Cloudflare":"cloudflare",
+"DoorDash":"doordash",
+"Duolingo":"duolingo",
+"Okta":"okta",
+"SoFi":"sofi",
+"Uber":"uber",
+"Unity":"unity"
+}
+
 def lever():
 
     jobs=[]
 
     for company,slug in LEVER.items():
 
-        url=f"https://api.lever.co/v0/postings/{slug}?mode=json"
-
         try:
+            url=f"https://api.lever.co/v0/postings/{slug}?mode=json"
             data=requests.get(url,timeout=10).json()
 
             for j in data:
@@ -171,8 +180,7 @@ def lever():
                 loc=j.get("categories",{}).get("location","")
                 link=j.get("hostedUrl","")
 
-                if good(title):
-
+                if good(title,loc):
                     jobs.append(Job(company,title,loc,link,"lever"))
 
         except:
@@ -181,36 +189,32 @@ def lever():
     return jobs
 
 ############################################
-# GOOGLE RSS (补 Big Tech)
+# GOOGLE RSS (Big Tech coverage)
 ############################################
 
 def google_rss():
 
     jobs=[]
 
-    import urllib.parse
-    
-    query='("finance" OR "strategy" OR "investment banking") job site:myworkdayjobs.com'
-    
-    url="https://news.google.com/rss/search?q="+urllib.parse.quote(query)
+    query='(site:myworkdayjobs.com OR site:careers.google.com OR site:jobs.apple.com) ("finance" OR "strategy" OR "corporate development")'
 
+    url="https://news.google.com/rss/search?q="+urllib.parse.quote(query)
 
     feed=feedparser.parse(url)
 
-    for e in feed.entries[:50]:
+    for e in feed.entries[:80]:
 
         title=e.title
         link=e.link
 
-        if good(title):
+        company="Unknown"
+        for c in TARGET_COMPANIES:
+            if c.lower() in title.lower():
+                company=c
+                break
 
-            company="Unknown"
-            for c in TARGET_COMPANIES:
-                if c.lower() in title.lower():
-                    company=c
-                    break
-
-            jobs.append(Job(company,title,"",""+link,"rss"))
+        if good(title,"US"):
+            jobs.append(Job(company,title,"US",link,"rss"))
 
     return jobs
 
@@ -218,7 +222,7 @@ def google_rss():
 # FLOOD CONTROL
 ############################################
 
-def limit_company(jobs):
+def balance(jobs):
 
     counts={}
     final=[]
@@ -270,11 +274,11 @@ def send(jobs):
 def main():
 
     jobs=[]
+
     jobs+=greenhouse()
     jobs+=lever()
     jobs+=google_rss()
 
-    # 去重
     unique={}
     for j in jobs:
         key=(j.company,j.title)
@@ -283,8 +287,7 @@ def main():
 
     final=list(unique.values())
 
-    # 按公司防洪
-    final=limit_company(final)
+    final=balance(final)
 
     send(final)
 

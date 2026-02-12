@@ -1,30 +1,66 @@
 import os
 import re
-import smtplib
+import json
+import time
 import hashlib
+import smtplib
 import urllib.parse
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import requests
+from dateutil import parser as dateparser
+from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
-import feedparser
 
-# =======================
-# Email config (Gmail SMTP)
-# =======================
-SENDER = os.environ["JOBRADAR_EMAIL_FROM"]
-RECEIVER = os.environ["JOBRADAR_EMAIL_TO"]
-PASSWORD = os.environ["JOBRADAR_EMAIL_APP_PASSWORD"]
+# =========================
+# CONFIG
+# =========================
 
+LOOKBACK_HOURS = 6
+MAX_EMAIL_ITEMS = 80
+REQUEST_TIMEOUT = 20
+USER_AGENT = "job-radar/1.0 (personal use)"
+
+# Gmail SMTP (use App Password)
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 587
 
-MAX_ITEMS_EMAIL = 60  # 
-PER_FEED_LIMIT = 40   # 
+STATE_PATH = "state/seen.json"   # persisted via GitHub Actions cache
 
-# =======================
-# Your priority company list
-# =======================
-COMPANIES = [
+# ---- Keyword engine (broad, high-volume) ----
+KW_HIGH = [
+    # Core finance / FP&A
+    "strategic finance","finance strategy","product finance","business finance","finance business partner",
+    "corporate finance","fp&a","planning and analysis","planning & analysis","forecasting","budgeting",
+    "variance","kpi","operational finance","commercial finance","go-to-market finance","gtm finance",
+    "revenue finance","pricing finance","growth finance","monetization finance","accounting",
+
+    # Deals / consulting overlap
+    "corporate development","corp dev","m&a","mergers","acquisitions","transaction","due diligence",
+    "valuation","investment analysis","deal analysis","lbo","dcf","investment bank","deal"
+
+    # BizOps / strategy overlap (often finance-adjacent in tech)
+    "bizops","business operations","strategy & operations","strategy and operations","business insights",
+    "performance analytics","planning analyst","business analytics","analytics strategy"
+]
+
+KW_MED = [
+    "financial analyst","finance analyst","finance manager","finance associate","strategy analyst",
+    "business analyst","operations analyst","revenue analyst","pricing analyst","growth analyst",
+    "monetization","pricing strategy","go-to-market","gtm","analytics","sql","etl","dashboard","reporting",
+    "planning","strategic planning","commercial"
+]
+
+NEGATIVE = [
+    "warehouse","area manager","night shift","hourly","driver","fulfillment","store associate","retail",
+    "manufacturing","plant","security guard","nurse","cna","pharmacist","call center"
+]
+
+# ---- Target companies you care about (used for scoring boost + LinkedIn search link text) ----
+TARGET_COMPANY_NAMES = [
     "Adobe","Affirm","Airbnb","Amazon","Anthropic","Apple","Atlassian","Brex","Chime","Cisco","Cloudflare",
     "Coinbase","Databricks","Datadog","Discord","DocuSign","DoorDash","Duolingo","Google","Elastic","Figma",
     "Jane Street","LinkedIn","Lyft","MathWorks","Meta","Microsoft","Netflix","Next Insurance","Lemonade",
@@ -33,194 +69,408 @@ COMPANIES = [
     "Twilio","Uber","Unity","Wayve","Wealthfront","Betterment","Workday","Zendesk"
 ]
 
-# =======================
-# Keyword engine: “apply like a monster”
-# =======================
-KW_HIGH = [
-    # Finance core
-    "strategic finance","finance strategy","product finance","business finance","finance business partner",
-    "corporate finance","fp&a","planning and analysis","planning & analysis","forecasting","budgeting","variance",
-    "kpi","operational finance","commercial finance","gtm finance","revenue finance","pricing finance",
-    "growth finance","monetization finance","investment bank","accounting",
+# =========================
+# ATS SOURCES
+# =========================
+# IMPORTANT: These "slugs" are ATS identifiers, not company names.
+# If a company doesn't return jobs, it likely uses a different ATS or a different slug.
+# You can add/remove entries freely.
 
-    # Consulting / deal overlap
-    "corporate development","corp dev","m&a","mergers","acquisitions","transaction","transactions",
-    "due diligence","valuation","lbo","dcf","investment analysis","deal analysis",
+GREENHOUSE_SLUGS = {
+    # Common GH board slugs (starter set)
+    "Airbnb": "airbnb",
+    "Coinbase": "coinbase",
+    "Databricks": "databricks",
+    "Datadog": "datadog",
+    "Discord": "discord",
+    "Figma": "figma",
+    "Notion": "notion",
+    "Plaid": "plaid",
+    "Robinhood": "robinhood",
+    "Scale AI": "scaleai",
+    "Snowflake": "snowflake",
+    "Stripe": "stripe",
+    "Twilio": "twilio",
+    "Zendesk": "zendesk",
+    # Add more as you confirm slugs
+}
 
-    # BizOps / strategy overlap (tech finance)
-    "bizops","business operations","strategy & operations","strategy and operations","business insights",
-    "performance analytics","planning analyst","business analytics"
-]
+LEVER_SLUGS = {
+    # Common Lever slugs (starter set)
+    "Ramp": "ramp",
+    "Brex": "brex",
+    "Chime": "chime",
+    "Cloudflare": "cloudflare",
+    "DoorDash": "doordash",
+    "Duolingo": "duolingo",
+    "Nextdoor": "nextdoor",
+    "Okta": "okta",
+    "SoFi": "sofi",
+    "Uber": "uber",
+    "Unity": "unity",
+    "Wealthfront": "wealthfront",
+    # Add more as you confirm slugs
+}
 
-KW_MED = [
-    "financial analyst","finance analyst","finance manager","finance associate","strategy analyst",
-    "business analyst","operations analyst","revenue analyst","pricing analyst","growth analyst",
-    "monetization","pricing","go-to-market","gtm","analytics","sql","etl","dashboard","reporting"
-]
+SMARTRECRUITERS_COMPANY_KEYS = {
+    # SmartRecruiters uses a "company key" in the URL, often matches brand name but not always
+    "Atlassian": "Atlassian",
+    "Splunk": "Splunk",
+    # Add more as needed
+}
 
-NEGATIVE = [
-    "warehouse","area manager","night shift","hourly","driver","fulfillment","security","nurse","cna",
-    "retail","store associate","manufacturing","plant","pharmacist"
-]
+# If you want to aggressively expand beyond your list, add additional slugs here.
 
-# =======================
-# Google RSS helpers
-# =======================
-def google_rss(query: str) -> str:
-    q = urllib.parse.quote_plus(query)
-    return f"https://www.google.com/search?q={q}&num=50&output=rss"
 
+# =========================
+# DATA MODEL
+# =========================
+@dataclass
+class Job:
+    source: str              # greenhouse / lever / smartrecruiters
+    company: str
+    title: str
+    location: str
+    posted_at: Optional[datetime]
+    apply_url: str
+    description_snippet: str
+
+    def uid(self) -> str:
+        base = f"{self.source}|{self.company}|{self.title}|{self.apply_url}"
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()[:24]
+
+
+# =========================
+# UTIL
+# =========================
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-def score(title: str, snippet: str) -> int:
-    t = norm(title)
-    s = norm(snippet)
+def score_job(job: Job) -> int:
+    t = norm(job.title)
+    d = norm(job.description_snippet)
+    c = norm(job.company)
 
     for bad in NEGATIVE:
-        if bad in t or bad in s:
+        if bad in t or bad in d:
             return -999
 
-    sc = 0
+    score = 0
+
+    # Boost target companies
+    for name in TARGET_COMPANY_NAMES:
+        if norm(name) in c:
+            score += 8
+            break
+
     for kw in KW_HIGH:
-        if kw in t or kw in s:
-            sc += 10
+        if kw in t or kw in d:
+            score += 10
     for kw in KW_MED:
-        if kw in t or kw in s:
-            sc += 5
+        if kw in t or kw in d:
+            score += 5
 
-    # Title nudges
-    if "manager" in t: sc += 2
-    if "senior" in t or "sr " in t or t.startswith("sr"): sc += 1
-    if "intern" in t: sc -= 2  
+    # Small nudges
+    if "manager" in t: score += 2
+    if "senior" in t or t.startswith("sr"): score += 1
+    if "intern" in t: score -= 2
 
-    return sc
+    return score
 
-def detect_company(text: str) -> str | None:
-    txt = norm(text)
-    for c in COMPANIES:
-        if norm(c) in txt:
-            return c
-    return None
+def safe_dt(dt_str: Optional[str]) -> Optional[datetime]:
+    if not dt_str:
+        return None
+    try:
+        return dateparser.parse(dt_str)
+    except Exception:
+        return None
 
-def jid(title: str, link: str) -> str:
-    return hashlib.sha256((title + "||" + link).encode("utf-8")).hexdigest()[:20]
+def linkedin_referral_search_link(company: str, title: str) -> str:
+    # Safe: just a search URL you click manually
+    q = f'{company} finance strategy FP&A "{title}"'
+    return "https://www.linkedin.com/search/results/people/?keywords=" + urllib.parse.quote(q)
 
-# =======================
-# Build multi-search queries
-# =======================
-def build_queries():
-    # 1) 全网广撒网（高产）
-    broad = (
-        '('
-        '"strategic finance" OR "product finance" OR "finance business partner" OR FP&A OR '
-        '"corporate finance" OR "finance analyst" OR "business operations" OR bizops OR '
-        '"strategy & operations" OR "revenue analyst" OR monetization OR pricing OR '
-        '"corporate development" OR "M&A" OR valuation OR "due diligence"'
-        ') jobs'
-    )
+def load_seen() -> Dict[str, float]:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    if not os.path.exists(STATE_PATH):
+        return {}
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
 
-    # 2) target company（强制出现你关心的公司）
-    # 分批是为了让 Google RSS 不至于太长太乱
-    company_batches = []
-    batch_size = 12
-    for i in range(0, len(COMPANIES), batch_size):
-        batch = COMPANIES[i:i+batch_size]
-        company_part = "(" + " OR ".join([f'"{c}"' for c in batch]) + ")"
-        q = f'{company_part} ({broad})'
-        company_batches.append(q)
+def save_seen(seen: Dict[str, float]) -> None:
+    os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
+    with open(STATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(seen, f, ensure_ascii=False, indent=2)
 
-    # 3) ATS 来源加权（Greenhouse/Lever/Workday/Ashby）
-    ats = (
-        '('
-        'site:boards.greenhouse.io OR site:jobs.lever.co OR site:myworkdayjobs.com OR '
-        'site:ashbyhq.com OR site:smartrecruiters.com'
-        ') '
-        + broad
-    )
+def is_recent(job: Job, cutoff: datetime) -> bool:
+    # If we have posted_at, enforce cutoff. If not, allow (some ATS don’t provide accurate timestamps).
+    if job.posted_at is None:
+        return True
+    # normalize to aware UTC if possible
+    if job.posted_at.tzinfo is None:
+        dt = job.posted_at.replace(tzinfo=timezone.utc)
+    else:
+        dt = job.posted_at.astimezone(timezone.utc)
+    return dt >= cutoff
 
-    # 4) 你的大厂 + fintech 特别常见的 finance/strategy 关键词组合
-    tech_finance = (
-        '('
-        '"growth & monetization" OR "growth and monetization" OR "finance & strategy" OR '
-        '"finance and strategy" OR "pricing strategy" OR "gtm strategy" OR "revenue strategy" OR '
-        '"business finance" OR "strategic planning"'
-        ') jobs'
-    )
+def http_get_json(url: str) -> Any:
+    headers = {"User-Agent": USER_AGENT}
+    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
 
-    queries = [broad, ats, tech_finance] + company_batches
-    return queries
+def http_get_text(url: str) -> str:
+    headers = {"User-Agent": USER_AGENT}
+    r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    return r.text
 
-# =======================
-# Fetch & rank
-# =======================
-def fetch_jobs():
-    queries = build_queries()
-    seen = set()
-    results = []
 
-    for q in queries:
-        url = google_rss(q)
-        feed = feedparser.parse(url)
+# =========================
+# GREENHOUSE
+# =========================
+def fetch_greenhouse_jobs() -> List[Job]:
+    jobs: List[Job] = []
+    for company, slug in GREENHOUSE_SLUGS.items():
+        url = f"https://boards-api.greenhouse.io/v1/boards/{slug}/jobs?content=true"
+        try:
+            data = http_get_json(url)
+            for j in data.get("jobs", []):
+                title = j.get("title", "").strip()
+                location = (j.get("location") or {}).get("name", "") or ""
+                apply_url = j.get("absolute_url", "") or ""
+                updated_at = j.get("updated_at")
+                created_at = j.get("created_at")
+                posted_at = safe_dt(updated_at) or safe_dt(created_at)
 
-        for e in feed.entries[:PER_FEED_LIMIT]:
-            title = getattr(e, "title", "").strip()
-            link = getattr(e, "link", "").strip()
-            summary = getattr(e, "summary", "")
+                # description content can be long HTML; we keep a snippet
+                content = (j.get("content") or "")
+                snippet = re.sub("<[^<]+?>", " ", content)  # strip HTML tags
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:800]
 
-            if not title or not link:
-                continue
+                if not (title and apply_url):
+                    continue
 
-            key = jid(title, link)
-            if key in seen:
-                continue
-            seen.add(key)
+                jobs.append(Job(
+                    source="greenhouse",
+                    company=company,
+                    title=title,
+                    location=location,
+                    posted_at=posted_at,
+                    apply_url=apply_url,
+                    description_snippet=snippet
+                ))
+        except Exception:
+            # Skip quietly; you can inspect failures in Actions logs
+            continue
+    return jobs
 
-            sc = score(title, summary)
-            if sc < 0:
-                continue
 
-            comp = detect_company(title) or detect_company(summary) or "Unknown"
-            results.append((sc, comp, title, link))
+# =========================
+# LEVER
+# =========================
+def fetch_lever_jobs() -> List[Job]:
+    jobs: List[Job] = []
+    for company, slug in LEVER_SLUGS.items():
+        url = f"https://api.lever.co/v0/postings/{slug}?mode=json"
+        try:
+            data = http_get_json(url)
+            for j in data:
+                title = (j.get("text") or "").strip()
+                apply_url = j.get("hostedUrl") or j.get("applyUrl") or ""
+                categories = j.get("categories") or {}
+                location = (j.get("categories") or {}).get("location") or (j.get("location") or "")
+                if isinstance(location, dict):
+                    location = location.get("name", "") or ""
 
-    # sort high score first, then company name
-    results.sort(key=lambda x: (-x[0], x[1], x[2]))
-    return results[:MAX_ITEMS_EMAIL]
+                created_at_ms = j.get("createdAt")
+                posted_at = None
+                if isinstance(created_at_ms, (int, float)):
+                    posted_at = datetime.fromtimestamp(created_at_ms / 1000, tz=timezone.utc)
 
-def send_email(items):
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    subject = f"🔥 Job Radar — Top Matches ({len(items)}) — {now}"
+                # Lever provides description in HTML
+                desc_html = j.get("description") or ""
+                snippet = re.sub("<[^<]+?>", " ", desc_html)
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:800]
 
-    li = []
-    for sc, comp, title, link in items:
-        li.append(f"<li><b>{comp}</b> — {title} "
-                  f"(score {sc}) — <a href='{link}'>Apply</a></li>")
+                if not (title and apply_url):
+                    continue
 
-    html = f"""
-    <p>Hi Sheila 😈，这是最新抓到的岗位（点击直接投递）：</p>
-    <ol>
-      {''.join(li)}
-    </ol>
-    <p>Tip：你想某家公司更密集出现，我可以把它放进“超级优先名单”。</p>
-    """
+                jobs.append(Job(
+                    source="lever",
+                    company=company,
+                    title=title,
+                    location=str(location or ""),
+                    posted_at=posted_at,
+                    apply_url=apply_url,
+                    description_snippet=snippet
+                ))
+        except Exception:
+            continue
+    return jobs
 
-    msg = MIMEText(html, "html", "utf-8")
-    msg["Subject"] = subject
+
+# =========================
+# SMARTRECRUITERS
+# =========================
+def fetch_smartrecruiters_jobs() -> List[Job]:
+    jobs: List[Job] = []
+    for company, key in SMARTRECRUITERS_COMPANY_KEYS.items():
+        # Public API endpoint
+        url = f"https://api.smartrecruiters.com/v1/companies/{key}/postings"
+        try:
+            data = http_get_json(url)
+            for j in data.get("content", []):
+                title = (j.get("name") or "").strip()
+                apply_url = j.get("ref") or j.get("applyUrl") or ""
+                location = (j.get("location") or {}).get("city", "") or ""
+                country = (j.get("location") or {}).get("country", "") or ""
+                loc = ", ".join([x for x in [location, country] if x])
+
+                posted_at = safe_dt(j.get("releasedDate"))
+
+                snippet = (j.get("jobAd") or {}).get("sections", {}).get("companyDescription", "") or ""
+                snippet = re.sub(r"\s+", " ", snippet).strip()[:800]
+
+                if not (title and apply_url):
+                    continue
+
+                jobs.append(Job(
+                    source="smartrecruiters",
+                    company=company,
+                    title=title,
+                    location=loc,
+                    posted_at=posted_at,
+                    apply_url=apply_url,
+                    description_snippet=snippet
+                ))
+        except Exception:
+            continue
+    return jobs
+
+
+# =========================
+# EMAIL
+# =========================
+def send_email(subject: str, html_body: str) -> None:
+    msg = MIMEMultipart("alternative")
     msg["From"] = SENDER
     msg["To"] = RECEIVER
+    msg["Subject"] = subject
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.ehlo()
         server.starttls()
         server.login(SENDER, PASSWORD)
         server.sendmail(SENDER, [RECEIVER], msg.as_string())
 
+
+# =========================
+# MAIN
+# =========================
 def main():
-    jobs = fetch_jobs()
-    if not jobs:
-        # 也发个空邮件，告诉你系统活着（避免你以为坏了）
-        send_email([(0, "System", "No matches found this run — consider broadening keywords", "https://www.google.com")])
+    sender = os.environ["JOBRADAR_EMAIL_FROM"]
+    receiver = os.environ["JOBRADAR_EMAIL_TO"]
+    password = os.environ["JOBRADAR_EMAIL_APP_PASSWORD"]
+    globals()["SENDER"] = sender
+    globals()["RECEIVER"] = receiver
+    globals()["PASSWORD"] = password
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=LOOKBACK_HOURS)
+
+    seen = load_seen()
+
+    all_jobs: List[Job] = []
+    all_jobs += fetch_greenhouse_jobs()
+    all_jobs += fetch_lever_jobs()
+    all_jobs += fetch_smartrecruiters_jobs()
+
+    # Filter + dedupe + score
+    items: List[Tuple[int, Job]] = []
+    for job in all_jobs:
+        uid = job.uid()
+
+        # skip already emailed
+        if uid in seen:
+            continue
+
+        # recency filter (best effort)
+        if not is_recent(job, cutoff):
+            continue
+
+        sc = score_job(job)
+        if sc < 0:
+            continue
+
+        items.append((sc, job))
+
+    # Sort by score desc, then company/title
+    items.sort(key=lambda x: (-x[0], x[1].company.lower(), x[1].title.lower()))
+
+    # Limit email size
+    items = items[:MAX_EMAIL_ITEMS]
+
+    # Update seen state
+    ts = time.time()
+    for _, job in items:
+        seen[job.uid()] = ts
+
+    # prune seen to avoid unbounded growth
+    # keep last ~20k entries
+    if len(seen) > 20000:
+        # drop oldest (by timestamp)
+        seen_items = sorted(seen.items(), key=lambda kv: kv[1], reverse=True)[:20000]
+        seen = dict(seen_items)
+
+    save_seen(seen)
+
+    # Build email
+    subject = f"Job Radar — Top matches (last {LOOKBACK_HOURS}h): {len(items)}"
+    if not items:
+        html = f"""
+        <p>Hi Sheila,</p>
+        <p>No new matches found in the last {LOOKBACK_HOURS} hours from the current ATS sources.</p>
+        <p>This usually means either (1) those company slugs need adjustment, or (2) postings didn’t change in that window.</p>
+        <p>If you want, add more Greenhouse/Lever/SmartRecruiters slugs and this will immediately get louder.</p>
+        """
+        send_email(subject, html)
         return
-    send_email(jobs)
+
+    li = []
+    for sc, job in items:
+        posted = "unknown"
+        if job.posted_at:
+            dt = job.posted_at.astimezone(timezone.utc) if job.posted_at.tzinfo else job.posted_at.replace(tzinfo=timezone.utc)
+            posted = dt.strftime("%Y-%m-%d %H:%M UTC")
+
+        ref_link = linkedin_referral_search_link(job.company, job.title)
+
+        li.append(f"""
+        <li>
+          <b>{job.company}</b> — {job.title} <br/>
+          <span>Score: {sc} | Source: {job.source} | Location: {job.location or "N/A"} | Posted: {posted}</span><br/>
+          <a href="{job.apply_url}">Apply link</a>
+          &nbsp;|&nbsp;
+          <a href="{ref_link}">Find referrals on LinkedIn</a>
+        </li>
+        """)
+
+    html = f"""
+    <p>Hi Sheila,</p>
+    <p>Here are the newest matched roles from ATS sources (Greenhouse / Lever / SmartRecruiters) in the last {LOOKBACK_HOURS} hours.</p>
+    <ol>
+      {''.join(li)}
+    </ol>
+    <p>Tip: If a company is missing, it likely uses a different ATS or a different slug. Add its slug in the config and it will show up next run.</p>
+    """
+
+    send_email(subject, html)
+
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,31 @@
+name: Job Radar (6h)
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"   # every 6 hours (UTC)
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run job radar
+        env:
+          JOBRADAR_EMAIL_FROM: ${{ secrets.JOBRADAR_EMAIL_FROM }}
+          JOBRADAR_EMAIL_TO: ${{ secrets.JOBRADAR_EMAIL_TO }}
+          JOBRADAR_EMAIL_APP_PASSWORD: ${{ secrets.JOBRADAR_EMAIL_APP_PASSWORD }}
+        run: |
+          python job_radar.py

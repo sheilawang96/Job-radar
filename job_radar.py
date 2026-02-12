@@ -18,6 +18,21 @@ from email.mime.text import MIMEText
 # =========================
 # CONFIG
 # =========================
+# ======================
+# LOCATION FILTERING
+# ======================
+
+US_KEYWORDS = [
+    "united states", "united states of america", "u.s.", "u.s.a", "usa",
+    "remote - us", "remote (us)", "remote, us", "us remote"
+]
+
+
+CALIFORNIA_KEYWORDS = [
+    "california", "ca", "san francisco", "sf", "bay area",
+    "los angeles", "la", "santa clara", "palo alto",
+    "mountain view", "sunnyvale", "san jose", "redwood city"
+]
 
 LOOKBACK_HOURS = 6
 MAX_EMAIL_ITEMS = 80
@@ -143,6 +158,37 @@ class Job:
 # =========================
 # UTIL
 # =========================
+US_STATE_ABBR = {
+    "al","ak","az","ar","ca","co","ct","de","fl","ga","hi","id","il","in","ia","ks","ky","la","me","md",
+    "ma","mi","mn","ms","mo","mt","ne","nv","nh","nj","nm","ny","nc","nd","oh","ok","or","pa","ri","sc",
+    "sd","tn","tx","ut","vt","va","wa","wv","wi","wy","dc"
+}
+
+def location_priority(location: str) -> int:
+    loc = (location or "").lower().strip()
+
+    # if location missing → don't hard filter
+    if not loc:
+        return 8
+
+    is_ca = any(k in loc for k in CALIFORNIA_KEYWORDS)
+
+    # detect US via keyword OR state abbreviation OR CA
+    is_us_keyword = any(k in loc for k in US_KEYWORDS)
+    state_hit = any(re.search(rf"(\\b|,|\\()({st})(\\b|\\)|\\s)", loc) for st in US_STATE_ABBR)
+
+    is_us = is_us_keyword or state_hit or is_ca
+
+    # allow generic remote jobs
+    if not is_us and "remote" not in loc:
+        return -999
+
+    if is_ca:
+        return 20
+
+    return 5
+
+
 def norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
@@ -156,6 +202,12 @@ def score_job(job: Job) -> int:
             return -999
 
     score = 0
+    loc_score = location_priority(job.location)
+    if loc_score < 0:
+        return -999
+
+    score += loc_score
+
 
     # Boost target companies
     for name in TARGET_COMPANY_NAMES:

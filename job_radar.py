@@ -22,6 +22,18 @@ from email.mime.text import MIMEText
 
 LOOKBACK_HOURS = 6           
 MAX_EMAIL_ITEMS = 120
+# Per-company cap (prevents Amazon/Google flooding)
+MAX_PER_COMPANY_DEFAULT = 6
+
+COMPANY_CAPS = {
+    "Amazon": 4,
+    "Google": 5,
+    "Microsoft": 3,
+    "Meta": 4,
+    "Apple": 3,
+    "Nvidia": 2,
+}
+
 REQUEST_TIMEOUT = 15
 USER_AGENT = "job-radar/2.0 (personal use)"
 
@@ -571,7 +583,22 @@ def main():
         items.append((sc, job))
 
     items.sort(key=lambda x: (-x[0], x[1].company.lower(), x[1].title.lower()))
-    items = items[:MAX_EMAIL_ITEMS]
+    
+    # company quota filter
+    picked: List[Tuple[int, Job]] = []
+    company_counts: Dict[str, int] = {}
+    
+    for sc, job in items:
+        cap = COMPANY_CAPS.get(job.company, MAX_PER_COMPANY_DEFAULT)
+        if company_counts.get(job.company, 0) >= cap:
+            continue
+        picked.append((sc, job))
+        company_counts[job.company] = company_counts.get(job.company, 0) + 1
+        if len(picked) >= MAX_EMAIL_ITEMS:
+            break
+    
+    items = picked
+
 
     ts = time.time()
     for _, job in items:
